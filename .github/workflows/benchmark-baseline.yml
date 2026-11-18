@@ -1,0 +1,101 @@
+name: Benchmark Baseline (main)
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  baseline:
+    name: Build and benchmark ELD on main
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          path: eld
+
+      - name: Read LLVM version
+        run: |
+          LLVM_VER=$(cat eld/utils/benchmark/llvm-version.txt | tr -d '[:space:]')
+          echo "LLVM_VER=$LLVM_VER" >> $GITHUB_ENV
+
+      - name: Install LLVM from apt
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /usr/share/keyrings/llvm-archive-keyring.gpg >/dev/null
+          CODENAME=$(. /etc/os-release && echo $VERSION_CODENAME)
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] \
+            https://apt.llvm.org/${CODENAME}/ llvm-toolchain-${CODENAME}-${LLVM_VER} main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+          sudo apt-get update -q
+          sudo apt-get install -y llvm-${LLVM_VER}-dev clang-${LLVM_VER} \
+            ninja-build cmake time
+          echo "LLVM_DIR=/usr/lib/llvm-${LLVM_VER}/lib/cmake/llvm" >> $GITHUB_ENV
+
+      - name: Cache reproducers
+        id: cache-reproducers
+        uses: actions/cache@v4
+        with:
+          path: reproducers
+          key: lld-speed-test-llvm${{ env.LLVM_VER }}-${{ hashFiles('eld/utils/benchmark/workloads.txt') }}
+
+      - name: Collect reproducers
+        if: steps.cache-reproducers.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse \
+            https://github.com/llvm/llvm-project.git llvm-src
+          cd llvm-src
+          git sparse-checkout set lld/utils/speed-test-reproducers
+          mv lld/utils/speed-test-reproducers ../reproducers
+
+      - name: Build ELD (main)
+        run: |
+          cmake -G Ninja \
+            -S "$GITHUB_WORKSPACE/eld" \
+            -B build \
+            -DELD_USE_EXTERNAL_LLVM=ON \
+            -DLLVM_DIR="$LLVM_DIR" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang-${LLVM_VER} \
+            -DCMAKE_CXX_COMPILER=clang++-${LLVM_VER}
+          cmake --build build --target ld.eld -j$(nproc)
+
+      - name: Filter workloads
+        run: |
+          mkdir reproducers-filtered
+          WORKLOADS=$(grep -v '^\s*#' eld/utils/benchmark/workloads.txt | xargs)
+          for wl in $WORKLOADS; do
+            [ -d "reproducers/$wl" ] && ln -s "$PWD/reproducers/$wl" "reproducers-filtered/$wl"
+          done
+
+      - name: Run benchmark (main baseline)
+        run: |
+          bash eld/utils/benchmark/run_benchmark.sh \
+            --eld build/bin/ld.eld \
+            --reproducers reproducers-filtered \
+            > baseline.json
+
+      - name: Delete old baseline artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/actions/artifacts \
+            --jq '.artifacts[] | select(.name == "benchmark-baseline") | .id' | \
+          xargs -I{} gh api --method DELETE \
+            repos/${{ github.repository }}/actions/artifacts/{} || true
+
+      - name: Upload baseline artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-baseline
+          path: baseline.json
+          retention-days: 30
+          overwrite: true
